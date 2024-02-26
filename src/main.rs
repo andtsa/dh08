@@ -24,31 +24,13 @@ use static_cell::make_static;
 use embedded_io_async::Write;
 use defmt::*;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_stm32::can::frame::{ClassicData, FdFrame, Header};
 use embassy_stm32::peripherals::{ETH, FDCAN1};
 use embedded_nal_async::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpConnect};
 use rand_core::RngCore;
+use embedded_can;
+// use static_cell::StaticCell;
 
-use static_cell::StaticCell;
-
-// static RED_LED: Mutex<UnsafeCell<Option<Output<'static, Flex<dyn Pin<ExtiChannel=(), P=()>>>>>> = Mutex::new(UnsafeCell::new(None));
-
-// bind_interrupts!(struct Irqs {
-//     ETH => eth::InterruptHandler;
-//     RNG => rng::InterruptHandler<peripherals::RNG>;
-// });
-// bind_interrupts!(struct Irqs {
-//     FDCAN1_IT0 => ;
-//     // CAN3_RX1 => Rx1InterruptHandler<CAN3>;
-//     // CAN3_SCE => SceInterruptHandler<CAN3>;
-//     // CAN3_TX => TxInterruptHandler<CAN3>;
-// });
-
-// type Device = Ethernet<'static, embassy_stm32::peripherals::ETH, GenericSMI>;
-
-// #[embassy_executor::task]
-// async fn net_task(stack: &'static Stack<Device>) -> ! {
-//     stack.run().await
-// }
 bind_interrupts!(struct Irqs {
     FDCAN1_IT0 => can::IT0InterruptHandler<FDCAN1>;
     FDCAN1_IT1 => can::IT1InterruptHandler<FDCAN1>;
@@ -58,24 +40,10 @@ bind_interrupts!(struct Irqs {
 async fn main(spawner: Spawner) {
     info!("\x1b[106;31m hello world! \x1b[0m");
 
-    // config.rcc.fdcan_clock_source = rcc::FdCanClockSource::HSE;
-    //
-    // let peripherals = embassy_stm32::init(config);
-    //
-    // let mut can = can::Fdcan::new(peripherals.FDCAN1, peripherals.PA11, peripherals.PA12, Irqs);
-    //
-    // can.can.apply_config(
-    //     can::config::FdCanConfig::default().set_nominal_bit_timing(can::config::NominalBitTiming {
-    //         sync_jump_width: 1.try_into().unwrap(),
-    //         prescaler: 8.try_into().unwrap(),
-    //         seg1: 13.try_into().unwrap(),
-    //         seg2: 2.try_into().unwrap(),
-    //     }),
-    // );
     let mut config = Config::default();
     config.rcc.hse = Some(rcc::Hse {
-        freq: embassy_stm32::time::Hertz(25_000_000),
-        mode: rcc::HseMode::Oscillator,
+        freq: embassy_stm32::time::Hertz(8_000_000),
+        mode: rcc::HseMode::Bypass,
     });
     info!("\x1b[106;34m checkpoint 1 \x1b[0m");
     config.rcc.fdcan_clock_source = rcc::FdCanClockSource::HSE;
@@ -91,10 +59,7 @@ async fn main(spawner: Spawner) {
     can.set_bitrate(250_000);
     info!("\x1b[106;34m checkpoint 5 \x1b[0m");
 
-    // let mut can = can.into_internal_loopback_mode();
-    // let mut can = can.into_internal_loopback_mode();
     let mut can = can.into_normal_mode();
-    // let mut can = can.start(can::FdcanOperatingMode::BusMonitoringMode);
     info!("\x1b[106;34m checkpoint 6 \x1b[0m");
 
 
@@ -102,71 +67,42 @@ async fn main(spawner: Spawner) {
 
 
     let mut green_led = Output::new(peripherals.PB0, Level::High, Speed::Low);
-    let mut i = 0;
+    let mut i = 1u8;
     let mut last_read_ts = embassy_time::Instant::now();
 
-    info!("entering loop");
+
+    info!("entering loop: writing");
     loop {
-        let frame = can::frame::ClassicFrame::new_extended(0x123456F, &[i; 8]).unwrap();
-        info!("Writing frame");
+        // let id = embedded_can::Id::Standard(embedded_can::StandardId::new(i as u16).unwrap());
+        // let payload = ClassicData::new(&[0, 0, 0]).unwrap();
+        // let frame = can::frame::ClassicFrame::new(Header::new(id, 8u8, false), payload);
+        let frame = can::frame::ClassicFrame::new_standard(i as u16, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        info!("Writing frame id={}", i);
         _ = can.write(&frame).await;
-        info!("\x1b[106;34m checkpoint 7 \x1b[0m");
-
-        match can.read().await {
-            Ok((rx_frame, ts)) => {
-                let delta = (ts - last_read_ts).as_millis();
-                last_read_ts = ts;
-                info!(
-                    "Rx: {:x} {:x} {:x} {:x} --- NEW {}",
-                    rx_frame.data()[0],
-                    rx_frame.data()[1],
-                    rx_frame.data()[2],
-                    rx_frame.data()[3],
-                    delta,
-                )
-            }
-            Err(_err) => error!("Error in frame"),
-        }
-
-        info!("\x1b[106;34m checkpoint 8 \x1b[0m");
-
-        Timer::after_millis(250).await;
-
-        i += 1;
-        if i > 3 {
-            break;
-        }
+        i+=1;
+        can.flush(0usize);
+        Timer::after_millis(1500).await;
     }
-
-    info!("\x1b[106;34m checkpoint 9: finished first loop \x1b[0m");
-
-
-    let (mut tx, mut rx) = can.split();
-    // With split
-    loop {
-        let frame = can::frame::ClassicFrame::new_extended(0x123456F, &[i; 8]).unwrap();
-        info!("Writing frame with split");
-        _ = tx.write(&frame).await;
-        info!("\x1b[106;34m checkpoint 10: split sent \x1b[0m");
-
-        match rx.read().await {
-            Ok((rx_frame, ts)) => {
-                let delta = (ts - last_read_ts).as_millis();
-                last_read_ts = ts;
-                info!(
-                    "Rx: {:x} {:x} {:x} {:x} --- NEW {}",
-                    rx_frame.data()[0],
-                    rx_frame.data()[1],
-                    rx_frame.data()[2],
-                    rx_frame.data()[3],
-                    delta,
-                )
-            }
-            Err(_err) => error!("Error in frame"),
-        }
-
-        Timer::after_millis(250).await;
-
-        i += 1;
-    }
+    //
+    // info!("entering loop: reading");
+    // loop {
+    //     match can.read_fd().await {
+    //         Ok((fd_frame, ts)) => {
+    //             let delta = (ts - last_read_ts).as_millis();
+    //             last_read_ts = ts;
+    //             info!(
+    //                 "Rx: {:x} {:x} {:x} {:x} --- NEW {}",
+    //                 fd_frame.data()[0],
+    //                 fd_frame.data()[1],
+    //                 fd_frame.data()[2],
+    //                 fd_frame.data()[3],
+    //                 delta,
+    //             )
+    //         }
+    //         Err(e) => {
+    //             error!("something broke :(");
+    //             // error!("{}",e.to_string());
+    //         }
+    //     }
+    // }
 }
