@@ -1,108 +1,147 @@
-// #![feature(trait_alias)]
-#![allow(unused)]
-#![feature(type_alias_impl_trait)]
 #![no_std]
 #![no_main]
+#![feature(type_alias_impl_trait)]
 
-// mod tfwipanic;
 
-use core::cell::UnsafeCell;
-use cortex_m::interrupt::Mutex;
-use defmt::export::panic;
-use embassy_executor::Spawner;
-use embassy_net::{Ipv4Address, Stack, StackResources};
-use embassy_net::tcp::TcpSocket;
-use embassy_stm32::{bind_interrupts, eth, peripherals, rng, Config, can, rcc};
-use embassy_stm32::eth::{Ethernet, InterruptHandler, PacketQueue};
-use embassy_stm32::eth::generic_smi::GenericSMI;
-use embassy_stm32::exti::ExtiInput;
-use embassy_stm32::gpio::{Flex, Input, Level, Output, Pin, Pull, Speed};
-use embassy_stm32::rng::Rng;
-use {defmt_rtt as _, panic_probe as _};
-use embassy_time::{Duration, block_for, Timer};
-use static_cell::make_static;
-use embedded_io_async::Write;
 use defmt::*;
+use embassy_executor::Spawner;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_stm32::can::frame::{ClassicData, FdFrame, Header};
-use embassy_stm32::peripherals::{ETH, FDCAN1};
+use embassy_net::{Stack, StackResources};
+use embassy_stm32::eth::generic_smi::GenericSMI;
+use embassy_stm32::eth::{Ethernet, PacketQueue};
+use embassy_stm32::peripherals::ETH;
+use embassy_stm32::rng::Rng;
+use embassy_stm32::{bind_interrupts, eth, peripherals, rng, Config};
+use embassy_time::Timer;
+use embedded_io_async::Write;
 use embedded_nal_async::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpConnect};
 use rand_core::RngCore;
-use embedded_can;
-// use static_cell::StaticCell;
+use static_cell::StaticCell;
+use {defmt_rtt as _, panic_probe as _};
+use log::info;
 
 bind_interrupts!(struct Irqs {
-    FDCAN1_IT0 => can::IT0InterruptHandler<FDCAN1>;
-    FDCAN1_IT1 => can::IT1InterruptHandler<FDCAN1>;
+    ETH => eth::InterruptHandler;
+    RNG => rng::InterruptHandler<peripherals::RNG>;
 });
 
+type Device = Ethernet<'static, ETH, GenericSMI>;
+
+#[embassy_executor::task]
+async fn net_task(stack: &'static Stack<Device>) -> ! {
+    stack.run().await
+}
+
 #[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    info!("\x1b[106;31m hello world! \x1b[0m");
-
+async fn main(spawner: Spawner) -> ! {
+    info!("starting");
     let mut config = Config::default();
-    config.rcc.hse = Some(rcc::Hse {
-        freq: embassy_stm32::time::Hertz(8_000_000),
-        mode: rcc::HseMode::Bypass,
-    });
-    info!("\x1b[106;34m checkpoint 1 \x1b[0m");
-    config.rcc.fdcan_clock_source = rcc::FdCanClockSource::HSE;
-    info!("\x1b[106;34m checkpoint 2 \x1b[0m");
-
-    let peripherals = embassy_stm32::init(config);
-    info!("\x1b[106;34m checkpoint 3 \x1b[0m");
-
-    let mut can = can::FdcanConfigurator::new(peripherals.FDCAN1, peripherals.PD0, peripherals.PD1, Irqs);
-    info!("\x1b[106;34m checkpoint 4 \x1b[0m");
-
-    // 250k bps
-    can.set_bitrate(250_000);
-    info!("\x1b[106;34m checkpoint 5 \x1b[0m");
-
-    let mut can = can.into_normal_mode();
-    info!("\x1b[106;34m checkpoint 6 \x1b[0m");
-
-
-    info!("Configured");
-
-
-    let mut green_led = Output::new(peripherals.PB0, Level::High, Speed::Low);
-    let mut i = 1u8;
-    let mut last_read_ts = embassy_time::Instant::now();
-
-
-    info!("entering loop: writing");
-    loop {
-        // let id = embedded_can::Id::Standard(embedded_can::StandardId::new(i as u16).unwrap());
-        // let payload = ClassicData::new(&[0, 0, 0]).unwrap();
-        // let frame = can::frame::ClassicFrame::new(Header::new(id, 8u8, false), payload);
-        let frame = can::frame::ClassicFrame::new_standard(i as u16, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-        info!("Writing frame id={}", i);
-        _ = can.write(&frame).await;
-        i+=1;
-        can.flush(0usize);
-        Timer::after_millis(1500).await;
+    {
+        use embassy_stm32::rcc::*;
+        config.rcc.hsi = Some(HSIPrescaler::DIV1);
+        config.rcc.csi = true;
+        config.rcc.hsi48 = Some(Default::default()); // needed for RNG
+        config.rcc.pll1 = Some(Pll {
+            source: PllSource::HSI,
+            prediv: PllPreDiv::DIV4,
+            mul: PllMul::MUL50,
+            divp: Some(PllDiv::DIV2),
+            divq: None,
+            divr: None,
+        });
+        config.rcc.sys = Sysclk::PLL1_P; // 400 Mhz
+        config.rcc.ahb_pre = AHBPrescaler::DIV2; // 200 Mhz
+        config.rcc.apb1_pre = APBPrescaler::DIV2; // 100 Mhz
+        config.rcc.apb2_pre = APBPrescaler::DIV2; // 100 Mhz
+        config.rcc.apb3_pre = APBPrescaler::DIV2; // 100 Mhz
+        config.rcc.apb4_pre = APBPrescaler::DIV2; // 100 Mhz
+        config.rcc.voltage_scale = VoltageScale::Scale1;
     }
-    //
-    // info!("entering loop: reading");
-    // loop {
-    //     match can.read_fd().await {
-    //         Ok((fd_frame, ts)) => {
-    //             let delta = (ts - last_read_ts).as_millis();
-    //             last_read_ts = ts;
-    //             info!(
-    //                 "Rx: {:x} {:x} {:x} {:x} --- NEW {}",
-    //                 fd_frame.data()[0],
-    //                 fd_frame.data()[1],
-    //                 fd_frame.data()[2],
-    //                 fd_frame.data()[3],
-    //                 delta,
-    //             )
-    //         }
-    //         Err(e) => {
-    //             error!("something broke :(");
-    //             // error!("{}",e.to_string());
-    //         }
-    //     }
-    // }
+    let p = embassy_stm32::init(config);
+    info!("configured.");
+
+    // Generate random seed.
+    let mut rng = Rng::new(p.RNG, Irqs);
+    let mut seed = [0; 8];
+    rng.fill_bytes(&mut seed);
+    let seed = u64::from_le_bytes(seed);
+
+    let mac_addr = [0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+
+    static PACKETS: StaticCell<PacketQueue<16, 16>> = StaticCell::new();
+
+    let device = Ethernet::new_mii(
+        PACKETS.init(PacketQueue::<16, 16>::new()),
+        p.ETH,
+        Irqs,
+        p.PA1,
+        p.PC3,
+        p.PA2,
+        p.PC1,
+        p.PA7,
+        p.PC4,
+        p.PC5,
+        p.PB0,
+        p.PB1,
+        p.PG13,
+        p.PG12,
+        p.PC2,
+        p.PE2,
+        p.PG11,
+        GenericSMI::new(1),
+        mac_addr,
+    );
+    info!("Device created");
+
+    let config = embassy_net::Config::dhcpv4(Default::default());
+    info!("dhcp ran.");
+    //let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+    //    address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 1, 5), 24),
+    //    dns_servers: Vec::new(),
+    //    gateway: Some(Ipv4Address::new(192, 168, 1, 1)),
+    //});
+
+    // Init network stack
+    static STACK: StaticCell<Stack<Device>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let stack = &*STACK.init(Stack::new(
+        device,
+        config,
+        RESOURCES.init(StackResources::<3>::new()),
+        seed,
+    ));
+
+    // Launch network task
+    unwrap!(spawner.spawn(net_task(stack)));
+
+    // Ensure DHCP configuration is up before trying connect
+    stack.wait_config_up().await;
+
+    info!("Network task initialized");
+
+    let state: TcpClientState<1, 1024, 1024> = TcpClientState::new();
+    let client = TcpClient::new(&stack, &state);
+
+    loop {
+        // You need to start a server on the host machine, for example: `nc -l 8000`
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 6), 6942));
+
+        info!("connecting...");
+        let r = client.connect(addr).await;
+        if let Err(e) = r {
+            info!("connect error: {:?}", e);
+            Timer::after_secs(1).await;
+            continue;
+        }
+        let mut connection = r.unwrap();
+        info!("connected!");
+        loop {
+            let r = connection.write_all(b"Hello\n").await;
+            if let Err(e) = r {
+                info!("write error: {:?}", e);
+                break;
+            }
+            Timer::after_secs(1).await;
+        }
+    }
 }
